@@ -385,23 +385,26 @@ if active_dxf_bytes is not None:
                     </div>
                     """, unsafe_allow_html=True)
                 with r3:
+                    util_val = result.get('overall_utilization_pct', result.get('utilization_pct', 0.0))
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value" style="color: #60a5fa;">{result['overall_utilization_pct']}%</div>
+                        <div class="metric-value" style="color: #60a5fa;">{util_val:.1f}%</div>
                         <div class="metric-label">Material Yield (Efficiency)</div>
                     </div>
                     """, unsafe_allow_html=True)
                 with r4:
+                    scrap_val = result.get('overall_scrap_pct', result.get('scrap_pct', 100.0))
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value" style="color: #f87171;">{result['overall_scrap_pct']}%</div>
+                        <div class="metric-value" style="color: #f87171;">{scrap_val:.1f}%</div>
                         <div class="metric-label">Scrap Rate (%)</div>
                     </div>
                     """, unsafe_allow_html=True)
                 with r5:
+                    cut_val = result.get('total_cut_length_meters', result.get('total_cut_length_m', 0.0))
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value">{result['total_cut_length_meters']} m</div>
+                        <div class="metric-value">{cut_val:.2f} m</div>
                         <div class="metric-label">Total Laser Cut Path</div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -471,10 +474,10 @@ Purchasing & Material Recommendation:
 {result.get('procurement_advice', 'Custom/Manual Selection')}
 
 Production Metrics:
-- Sheets Required: {result['sheets_needed']}
-- Overall Material Yield: {result['overall_utilization_pct']}%
-- Overall Scrap Rate: {result['overall_scrap_pct']}%
-- Total Cutting Path: {result['total_cut_length_meters']} meters
+- Sheets Required: {result.get('sheets_needed', 1)}
+- Overall Material Yield: {result.get('overall_utilization_pct', result.get('utilization_pct', 0.0)):.1f}%
+- Overall Scrap Rate: {result.get('overall_scrap_pct', result.get('scrap_pct', 100.0)):.1f}%
+- Total Cutting Path: {result.get('total_cut_length_meters', result.get('total_cut_length_m', 0.0)):.2f} meters
 """
                     st.download_button(
                         label="📄 Download Production & Procurement Report (TXT)",

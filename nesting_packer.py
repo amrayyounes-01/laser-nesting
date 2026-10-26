@@ -371,8 +371,11 @@ class NestingEngine:
             "total_material_area_m2": round(total_material_area / 1e6, 3),
             "total_parts_net_area_m2": round(total_parts_net_area / 1e6, 3),
             "utilization_pct": round(overall_util, 1),
+            "overall_utilization_pct": round(overall_util, 1),
             "scrap_pct": round(overall_scrap, 1),
+            "overall_scrap_pct": round(overall_scrap, 1),
             "total_cut_length_m": round(total_cut_m, 2),
+            "total_cut_length_meters": round(total_cut_m, 2),
             "sheets": sheets
         }
 
