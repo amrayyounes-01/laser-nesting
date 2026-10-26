@@ -3,7 +3,8 @@ import math
 import re
 import tempfile
 import ezdxf
-from shapely.geometry import Polygon, MultiPolygon, Point, box, LineString
+from ezdxf.path import make_path
+from shapely.geometry import Polygon, MultiPolygon, Point, box, LineString, MultiPoint
 from shapely.ops import polygonize, unary_union
 
 class PartGeometry:
@@ -12,7 +13,7 @@ class PartGeometry:
         self.name = name
         self.matched_text = ""
         self.quantity = 1
-        self.outer_poly = None  # Shapely Polygon representing outer perimeter
+        self.outer_poly = None  # Shapely Polygon representing outer perimeter (including interior holes)
         self.holes = []         # List of Shapely Polygons for holes
         self.bounds = (0, 0, 0, 0)  # minx, miny, maxx, maxy
         self.width = 0.0
@@ -48,9 +49,16 @@ def parse_quantity_text(text_val):
 
 def parse_dxf_multi(dxf_input):
     """
-    Parses a DXF file that may contain one or MULTIPLE parts arranged next to each other,
+    Parses a DXF file containing one or MULTIPLE parts arranged next to each other,
     with text tags (e.g. Q10, Q9, Q1...) indicating the quantity of each part.
-    Returns a list of PartGeometry objects.
+    
+    Robust CAM Features:
+    - Explodes block references (INSERT) to capture components.
+    - Discretizes lines, arcs, splines, ellipses, and polylines with bulges.
+    - Groups parts by spatial connectivity (island clustering).
+    - Heals drafting micro-gaps (snapping tolerance = 1.5 mm).
+    - Unifies loops to absorb internal crosshairs and centerlines.
+    - Correctly maps circular bolt holes to their enclosing parts.
     """
     temp_path = None
     try:
@@ -86,7 +94,18 @@ def parse_dxf_multi(dxf_input):
 
     msp = doc.modelspace()
 
-    # 1. Collect all TEXT and MTEXT entities
+    # 1. Explode blocks (INSERT) so library components are accessible
+    try:
+        inserts = list(msp.query('INSERT'))
+        for ins in inserts:
+            try:
+                ins.explode()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2. Collect all TEXT and MTEXT entities
     texts = []
     for entity in msp.query('TEXT MTEXT'):
         try:
@@ -105,155 +124,183 @@ def parse_dxf_multi(dxf_input):
         except Exception:
             pass
 
-    # 2. Extract geometry edges and explicit closed polygons
-    edges = []
-    explicit_polygons = []
-    geom_entities = []
+    # 3. Extract geometry entities
+    IGNORE_LAYERS = {'DEFPOINTS', 'DIM', 'DIMENSIONS'}
+    contour_items = []
+    hole_items = []
 
-    # LWPOLYLINE
-    for entity in msp.query('LWPOLYLINE'):
+    # Polylines, Lines, Arcs, Splines, Ellipses
+    for e in msp.query('LWPOLYLINE POLYLINE LINE ARC SPLINE ELLIPSE'):
         try:
-            pts = [(p[0], p[1]) for p in entity.get_points()]
-            if len(pts) >= 2:
-                for i in range(len(pts) - 1):
-                    edges.append(LineString([pts[i], pts[i+1]]))
-                if entity.is_closed and len(pts) >= 3:
-                    edges.append(LineString([pts[-1], pts[0]]))
-                    p_poly = Polygon(pts)
-                    if p_poly.is_valid and p_poly.area > 0.01:
-                        explicit_polygons.append(p_poly)
-                geom_entities.append(entity)
-        except Exception:
-            pass
-
-    # 2D/3D POLYLINE
-    for entity in msp.query('POLYLINE'):
-        try:
-            pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
-            if len(pts) >= 2:
-                for i in range(len(pts) - 1):
-                    edges.append(LineString([pts[i], pts[i+1]]))
-                if entity.is_closed and len(pts) >= 3:
-                    edges.append(LineString([pts[-1], pts[0]]))
-                    p_poly = Polygon(pts)
-                    if p_poly.is_valid and p_poly.area > 0.01:
-                        explicit_polygons.append(p_poly)
-                geom_entities.append(entity)
-        except Exception:
-            pass
-
-    # LINE
-    for entity in msp.query('LINE'):
-        try:
-            p1 = (entity.dxf.start.x, entity.dxf.start.y)
-            p2 = (entity.dxf.end.x, entity.dxf.end.y)
-            if math.hypot(p2[0] - p1[0], p2[1] - p1[1]) > 0.0001:
-                edges.append(LineString([p1, p2]))
-                geom_entities.append(entity)
-        except Exception:
-            pass
-
-    # CIRCLE
-    for entity in msp.query('CIRCLE'):
-        try:
-            center = (entity.dxf.center.x, entity.dxf.center.y)
-            radius = entity.dxf.radius
-            if radius > 0.001:
-                c_poly = Point(center).buffer(radius, resolution=32)
-                if c_poly.is_valid and c_poly.area > 0.01:
-                    explicit_polygons.append(c_poly)
-                geom_entities.append(entity)
-        except Exception:
-            pass
-
-    # ARC
-    for entity in msp.query('ARC'):
-        try:
-            cx, cy = entity.dxf.center.x, entity.dxf.center.y
-            r = entity.dxf.radius
-            start_ang = math.radians(entity.dxf.start_angle)
-            end_ang = math.radians(entity.dxf.end_angle)
-            span = (end_ang - start_ang) % (2 * math.pi)
-            if span == 0:
-                span = 2 * math.pi
-
-            num_segs = max(8, int(span / (math.pi / 16)))
-            arc_pts = []
-            for i in range(num_segs + 1):
-                ang = start_ang + span * (i / num_segs)
-                arc_pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+            if hasattr(e.dxf, 'layer') and e.dxf.layer.upper() in IGNORE_LAYERS:
+                continue
             
-            for i in range(len(arc_pts) - 1):
-                edges.append(LineString([arc_pts[i], arc_pts[i+1]]))
-            geom_entities.append(entity)
-        except Exception:
-            pass
-
-    # SPLINE
-    for entity in msp.query('SPLINE'):
-        try:
-            pts = [(p[0], p[1]) for p in entity.flattening(distance=0.1)]
+            p = make_path(e)
+            pts = [(v.x, v.y) for v in p.flattening(distance=0.1)]
             if len(pts) >= 2:
-                for i in range(len(pts) - 1):
-                    edges.append(LineString([pts[i], pts[i+1]]))
-                if entity.closed and len(pts) >= 3:
-                    edges.append(LineString([pts[-1], pts[0]]))
-                geom_entities.append(entity)
+                lines = [LineString([pts[i], pts[i+1]]) for i in range(len(pts)-1)]
+                if getattr(e, 'is_closed', False) or getattr(e, 'closed', False):
+                    lines.append(LineString([pts[-1], pts[0]]))
+                minx = min(pt[0] for pt in pts)
+                maxx = max(pt[0] for pt in pts)
+                miny = min(pt[1] for pt in pts)
+                maxy = max(pt[1] for pt in pts)
+                contour_items.append({
+                    'entity': e,
+                    'lines': lines,
+                    'pts': pts,
+                    'bbox': box(minx, miny, maxx, maxy)
+                })
         except Exception:
             pass
 
-    # Reconstruct loops from lines and arcs
-    if edges:
+    # Circles
+    for e in msp.query('CIRCLE'):
         try:
-            merged_lines = unary_union(edges)
-            reconstructed = list(polygonize(merged_lines))
-            explicit_polygons.extend(reconstructed)
+            if hasattr(e.dxf, 'layer') and e.dxf.layer.upper() in IGNORE_LAYERS:
+                continue
+            cx, cy, r = e.dxf.center.x, e.dxf.center.y, e.dxf.radius
+            if r > 0.001:
+                hole_items.append({
+                    'entity': e,
+                    'center': (cx, cy),
+                    'radius': r,
+                    'poly': Point(cx, cy).buffer(r, resolution=32),
+                    'bbox': box(cx - r, cy - r, cx + r, cy + r)
+                })
         except Exception:
             pass
 
-    # Clean and deduplicate polygons
-    unique_polys = []
-    for p in explicit_polygons:
-        if p.is_valid and p.area > 0.01:
-            if not any(abs(p.area - u.area) < 0.05 and p.centroid.distance(u.centroid) < 0.1 for u in unique_polys):
-                unique_polys.append(p)
+    # Handle rare cases where ONLY circles exist (e.g. cutting circular blanks)
+    if not contour_items and hole_items:
+        parts = []
+        for idx, h in enumerate(hole_items):
+            part = PartGeometry(name=f"Part {idx + 1} (Circle)", part_id=idx + 1)
+            part.doc = doc
+            part.outer_poly = h['poly']
+            minx, miny, maxx, maxy = h['bbox'].bounds
+            part.bounds = (minx, miny, maxx, maxy)
+            part.width = maxx - minx
+            part.height = maxy - miny
+            part.area = math.pi * (h['radius'] ** 2)
+            part.total_perimeter = 2 * math.pi * h['radius']
+            part.dxf_entities = [h['entity']]
+            parts.append(part)
+        return parts
 
-    if not unique_polys:
-        raise ValueError("No closed geometry or cutting contours detected in this DXF file!")
+    if not contour_items:
+        raise ValueError("No cutting geometry detected in this DXF file!")
 
-    # Separate top-level outer boundaries:
-    # A polygon is an outer boundary if it is NOT contained inside another strictly larger polygon
-    outer_polygons = []
-    for p in unique_polys:
-        is_inner = False
-        for other in unique_polys:
-            if other != p and other.contains(p) and (other.area > p.area * 1.05):
-                is_inner = True
-                break
-        if not is_inner:
-            outer_polygons.append(p)
+    # 4. Cluster contour lines by spatial proximity (distance <= 3.0 mm)
+    clusters = []
+    for idx, item in enumerate(contour_items):
+        matched = []
+        b_exp = item['bbox'].buffer(3.0)
+        for c_idx, cl in enumerate(clusters):
+            if any(b_exp.intersects(contour_items[o_idx]['bbox']) for o_idx in cl):
+                matched.append(c_idx)
+        if not matched:
+            clusters.append([idx])
+        elif len(matched) == 1:
+            clusters[matched[0]].append(idx)
+        else:
+            new_cl = [idx]
+            for c_i in sorted(matched, reverse=True):
+                new_cl.extend(clusters.pop(c_i))
+            clusters.append(new_cl)
 
-    # Sort parts left-to-right (by X coordinate) to match visual layout in CAD
-    outer_polygons.sort(key=lambda p: p.bounds[0])
+    # Sort clusters from left to right (X ascending) to match visual CAD layout
+    clusters.sort(key=lambda cl: min(contour_items[i]['bbox'].bounds[0] for i in cl))
 
     parts = []
-    for idx, outer in enumerate(outer_polygons):
+    for idx, cl in enumerate(clusters):
+        cl_items = [contour_items[i] for i in cl]
+        cl_lines = [l for it in cl_items for l in it['lines']]
+        cl_ents = [it['entity'] for it in cl_items]
+
+        # Snap endpoints with 1.5mm tolerance to heal undershoots and drafting micro-gaps
+        pts = []
+        for l in cl_lines:
+            coords = list(l.coords)
+            pts.append(coords[0])
+            pts.append(coords[-1])
+        
+        snap_tol = 1.5
+        c_pts = []
+        for p in pts:
+            m = False
+            for cp in c_pts:
+                if math.hypot(p[0] - cp[0][0], p[1] - cp[0][1]) <= snap_tol:
+                    cp[1].append(p)
+                    cp[0] = (sum(pt[0] for pt in cp[1])/len(cp[1]), sum(pt[1] for pt in cp[1])/len(cp[1]))
+                    m = True
+                    break
+            if not m:
+                c_pts.append([(p[0], p[1]), [p]])
+
+        def get_snapped(p):
+            for cp in c_pts:
+                if math.hypot(p[0] - cp[0][0], p[1] - cp[0][1]) <= snap_tol:
+                    return cp[0]
+            return p
+
+        snapped_lines = []
+        for l in cl_lines:
+            coords = list(l.coords)
+            n_coords = [get_snapped(coords[0])]
+            for mid in coords[1:-1]:
+                n_coords.append(mid)
+            n_coords.append(get_snapped(coords[-1]))
+            if len(n_coords) >= 2 and (n_coords[0] != n_coords[-1] or len(n_coords) > 2):
+                snapped_lines.append(LineString(n_coords))
+
+        # Reconstruct closed loop(s)
+        merged = unary_union(snapped_lines)
+        polys = list(polygonize(merged))
+        outer_shell = None
+        if polys:
+            u = unary_union(polys)
+            if isinstance(u, Polygon):
+                outer_shell = u
+            elif isinstance(u, MultiPolygon):
+                outer_shell = max(u.geoms, key=lambda p: p.area)
+        
+        # Robust fallback: convex hull of all line points
+        if not outer_shell:
+            all_pts = [p for l in cl_lines for p in l.coords]
+            if len(all_pts) >= 3:
+                outer_shell = MultiPoint(all_pts).convex_hull
+
+        if not outer_shell or outer_shell.area <= 0.01:
+            continue
+
+        minx, miny, maxx, maxy = outer_shell.bounds
+        part_box = box(minx - 1.0, miny - 1.0, maxx + 1.0, maxy + 1.0)
+
+        # Match holes inside this part
+        part_holes = []
+        for h in hole_items:
+            if part_box.contains(Point(h['center'])):
+                part_holes.append(h['poly'])
+                cl_ents.append(h['entity'])
+
+        # Build Polygon with interior cutouts
+        if part_holes:
+            try:
+                outer_poly = Polygon(outer_shell.exterior.coords, [h.exterior.coords for h in part_holes])
+            except Exception:
+                outer_poly = outer_shell
+        else:
+            outer_poly = outer_shell
+
         part = PartGeometry(name=f"Part {idx + 1}", part_id=idx + 1)
         part.doc = doc
-        part.outer_poly = outer
-        minx, miny, maxx, maxy = outer.bounds
+        part.outer_poly = outer_poly
+        part.holes = part_holes
         part.bounds = (minx, miny, maxx, maxy)
         part.width = maxx - minx
         part.height = maxy - miny
-
-        # Identify holes strictly belonging to this outer boundary
-        part_holes = []
-        for u in unique_polys:
-            if u != outer and outer.contains(u) and (u.area < outer.area * 0.95):
-                # Ensure it's not a hole of a different part
-                part_holes.append(u)
-        part.holes = part_holes
-        part.area = max(0.01, outer.area - sum(h.area for h in part_holes))
+        part.area = max(0.01, outer_poly.area)
 
         # Match closest quantity text (e.g. Q10, Q9...)
         cx = (minx + maxx) / 2.0
@@ -262,11 +309,10 @@ def parse_dxf_multi(dxf_input):
         min_dist = float('inf')
         
         for t in texts:
-            # Heavily weight X alignment (columns) because Q-labels are placed above/below the part
             dx = abs(t['x'] - cx)
             dy = abs(t['y'] - cy)
             
-            # Check if text is roughly in the same X column (within part width + 50mm)
+            # Text is vertically aligned with this part's column
             if dx <= (part.width / 2.0 + 80.0):
                 dist = dx * 3.0 + dy
             else:
@@ -285,47 +331,37 @@ def parse_dxf_multi(dxf_input):
             part.matched_text = ""
             part.name = f"Part {idx + 1}"
 
-        # Collect DXF entities belonging to this part
-        part_bbox = box(minx - 1.5, miny - 1.5, maxx + 1.5, maxy + 1.5)
-        part_ents = []
+        # Calculate cutting perimeter
         part_cut_length = 0.0
-
-        for e in geom_entities:
+        for e in cl_ents:
             try:
                 etype = e.dxftype()
-                epos = None
-                elen = 0.0
                 if etype == 'LINE':
                     p1 = (e.dxf.start.x, e.dxf.start.y)
                     p2 = (e.dxf.end.x, e.dxf.end.y)
-                    epos = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
-                    elen = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-                elif etype in ('CIRCLE', 'ARC'):
-                    epos = (e.dxf.center.x, e.dxf.center.y)
+                    part_cut_length += math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                elif etype == 'CIRCLE':
+                    part_cut_length += 2 * math.pi * e.dxf.radius
+                elif etype == 'ARC':
                     r = e.dxf.radius
-                    if etype == 'CIRCLE':
-                        elen = 2 * math.pi * r
-                    else:
-                        sa = math.radians(e.dxf.start_angle)
-                        ea = math.radians(e.dxf.end_angle)
-                        sp = (ea - sa) % (2 * math.pi)
-                        elen = r * sp
-                elif etype in ('LWPOLYLINE', 'POLYLINE', 'SPLINE'):
-                    pts = e.get_points() if etype == 'LWPOLYLINE' else [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
-                    if pts:
-                        epos = (pts[0][0], pts[0][1])
-                        for i in range(len(pts) - 1):
-                            elen += math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1])
-
-                if epos and part_bbox.contains(Point(epos)):
-                    part_ents.append(e)
-                    part_cut_length += elen
+                    sa = math.radians(e.dxf.start_angle)
+                    ea = math.radians(e.dxf.end_angle)
+                    sp = (ea - sa) % (2 * math.pi)
+                    part_cut_length += r * sp
+                else:
+                    p = make_path(e)
+                    pts = [(v.x, v.y) for v in p.flattening(distance=0.1)]
+                    for i in range(len(pts) - 1):
+                        part_cut_length += math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1])
             except Exception:
                 pass
 
-        part.dxf_entities = part_ents
+        part.dxf_entities = cl_ents
         part.total_perimeter = part_cut_length if part_cut_length > 0 else (2 * (part.width + part.height))
         parts.append(part)
+
+    if not parts:
+        raise ValueError("No valid parts could be reconstructed from this DXF file!")
 
     return parts
 

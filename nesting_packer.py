@@ -249,7 +249,9 @@ class NestingEngine:
             # Orientations to test
             orientations = [(pw, ph, 0, base_poly)]
             if self.allow_rotation and abs(pw - ph) > 0.1:
-                orientations.append((ph, pw, 90, rotate(base_poly, 90, origin=(0, 0))))
+                rot_poly = rotate(base_poly, 90, origin=(0, 0))
+                rot_aligned = translate(rot_poly, xoff=-rot_poly.bounds[0], yoff=-rot_poly.bounds[1])
+                orientations.append((ph, pw, 90, rot_aligned))
 
             placed = False
             # 1. Try placing in existing shelves on the active sheet
@@ -455,43 +457,55 @@ class NestingEngine:
                 if pgeom and pgeom.dxf_entities:
                     src_minx = pgeom.bounds[0]
                     src_miny = pgeom.bounds[1]
+                    pw = pgeom.width
+                    ph = pgeom.height
+
                     for entity in pgeom.dxf_entities:
                         etype = entity.dxftype()
                         if etype == 'LINE':
-                            p1 = self._transform_pt(entity.dxf.start.x - src_minx, entity.dxf.start.y - src_miny, rot, target_x, target_y)
-                            p2 = self._transform_pt(entity.dxf.end.x - src_minx, entity.dxf.end.y - src_miny, rot, target_x, target_y)
+                            p1 = self._transform_pt(entity.dxf.start.x - src_minx, entity.dxf.start.y - src_miny, rot, target_x, target_y, pw, ph)
+                            p2 = self._transform_pt(entity.dxf.end.x - src_minx, entity.dxf.end.y - src_miny, rot, target_x, target_y, pw, ph)
                             out_msp.add_line(p1, p2, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
                             
                         elif etype == 'LWPOLYLINE':
                             pts = entity.get_points()
-                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
+                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y, pw, ph) for p in pts]
                             out_msp.add_lwpolyline(t_pts, close=entity.is_closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
                             
                         elif etype == 'POLYLINE':
                             pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
-                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
+                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y, pw, ph) for p in pts]
                             out_msp.add_lwpolyline(t_pts, close=entity.is_closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
                             
-                        elif etype == 'SPLINE':
-                            pts = [(p[0], p[1]) for p in entity.flattening(distance=0.1)]
-                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
-                            out_msp.add_lwpolyline(t_pts, close=entity.closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
+                        elif etype in ('SPLINE', 'ELLIPSE'):
+                            from ezdxf.path import make_path
+                            p = make_path(entity)
+                            pts = [(v.x, v.y) for v in p.flattening(distance=0.1)]
+                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y, pw, ph) for p in pts]
+                            out_msp.add_lwpolyline(t_pts, close=False, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
                             
                         elif etype == 'CIRCLE':
-                            c_pt = self._transform_pt(entity.dxf.center.x - src_minx, entity.dxf.center.y - src_miny, rot, target_x, target_y)
+                            cx_rel = entity.dxf.center.x - src_minx
+                            cy_rel = entity.dxf.center.y - src_miny
+                            c_pt = self._transform_pt(cx_rel, cy_rel, rot, target_x, target_y, pw, ph)
                             out_msp.add_circle(c_pt, radius=entity.dxf.radius, dxfattribs={'layer': 'LASER_HOLES', 'color': 2})
                             
                         elif etype == 'ARC':
-                            c_pt = self._transform_pt(entity.dxf.center.x - src_minx, entity.dxf.center.y - src_miny, rot, target_x, target_y)
+                            cx_rel = entity.dxf.center.x - src_minx
+                            cy_rel = entity.dxf.center.y - src_miny
+                            c_pt = self._transform_pt(cx_rel, cy_rel, rot, target_x, target_y, pw, ph)
                             new_start = (entity.dxf.start_angle + rot) % 360.0
                             new_end = (entity.dxf.end_angle + rot) % 360.0
                             out_msp.add_arc(c_pt, radius=entity.dxf.radius, start_angle=new_start, end_angle=new_end, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
                 else:
-                    # Fallback to polygon coords if raw entities not attached
+                    # Fallback to polygon coords (both exterior perimeter and interior holes)
                     if placed.polygon and not placed.polygon.is_empty:
                         for g in ([placed.polygon] if isinstance(placed.polygon, Polygon) else placed.polygon.geoms):
                             x, y = g.exterior.xy
                             out_msp.add_lwpolyline(list(zip(x, y)), close=True, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
+                            for interior in g.interiors:
+                                ix, iy = interior.xy
+                                out_msp.add_lwpolyline(list(zip(ix, iy)), close=True, dxfattribs={'layer': 'LASER_HOLES', 'color': 2})
 
             current_offset_x += sw + 300.0
 
@@ -499,8 +513,15 @@ class NestingEngine:
         return output_path
 
     @staticmethod
-    def _transform_pt(x, y, rotation_deg, target_x, target_y):
-        rad = math.radians(rotation_deg)
-        rx = x * math.cos(rad) - y * math.sin(rad)
-        ry = x * math.sin(rad) + y * math.cos(rad)
-        return (target_x + rx, target_y + ry)
+    def _transform_pt(x, y, rotation_deg, target_x, target_y, pw=0.0, ph=0.0):
+        if rotation_deg == 90:
+            rx = ph - y
+            ry = x
+            return (target_x + rx, target_y + ry)
+        elif rotation_deg == 0:
+            return (target_x + x, target_y + y)
+        else:
+            rad = math.radians(rotation_deg)
+            rx = x * math.cos(rad) - y * math.sin(rad)
+            ry = x * math.sin(rad) + y * math.cos(rad)
+            return (target_x + rx, target_y + ry)
