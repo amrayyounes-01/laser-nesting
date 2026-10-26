@@ -422,11 +422,21 @@ if active_dxf_bytes is not None:
                 st.write("")
                 st.subheader("💾 Export Machine & Production Files")
                 
+                col_opt1, col_opt2 = st.columns([1, 1])
+                with col_opt1:
+                    include_dxf_text = st.checkbox(
+                        "🔤 Include Text Labels in DXF",
+                        value=False,
+                        help="Disabled by default for CNC cutting safety so the laser machine does not cut text lines as contours."
+                    )
+                with col_opt2:
+                    st.caption("🛡️ **CNC Safety Mode Active:** By default, text annotations are excluded from the exported DXF file to prevent laser machines from burning text lines onto parts.")
+
                 output_dxf_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
                 output_dxf_path = output_dxf_temp.name
                 output_dxf_temp.close()
                 
-                engine.export_nested_dxf(detected_parts[0].doc, result['sheets'], output_dxf_path)
+                engine.export_nested_dxf(detected_parts[0].doc, result['sheets'], output_dxf_path, include_labels=include_dxf_text)
                 
                 with open(output_dxf_path, "rb") as df:
                     dxf_bytes = df.read()
@@ -434,7 +444,7 @@ if active_dxf_bytes is not None:
                 col_d1, col_d2 = st.columns(2)
                 with col_d1:
                     st.download_button(
-                        label="📥 Download Nested DXF (Ready for Laser CAM)",
+                        label="📥 Download Clean Nested DXF (Ready for Laser CAM)",
                         data=dxf_bytes,
                         file_name=f"nested_{active_filename}",
                         mime="application/dxf",
