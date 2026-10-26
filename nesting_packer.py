@@ -12,7 +12,7 @@ MARKET_SHEETS = [
 ]
 
 class PlacedPart:
-    def __init__(self, part_index, sheet_index, x, y, rotation, width, height, polygon):
+    def __init__(self, part_index, sheet_index, x, y, rotation, width, height, polygon, part_geom=None, label=""):
         self.part_index = part_index
         self.sheet_index = sheet_index
         self.x = x  # lower-left X on sheet
@@ -21,6 +21,8 @@ class PlacedPart:
         self.width = width
         self.height = height
         self.polygon = polygon
+        self.part_geom = part_geom
+        self.label = label
 
 class SheetResult:
     def __init__(self, sheet_index, width, height, sheet_name=None, is_remnant=False):
@@ -35,13 +37,11 @@ class SheetResult:
 
 def calculate_minimum_remnant(part_geom, quantity, spacing=6.0, margin=15.0, allow_rotation=True):
     """
-    Calculates the absolute minimum bounding offcut / remnant plate
-    required to produce the given quantity, avoiding cutting a full new sheet.
+    Calculates the minimum bounding offcut plate for a single part repeated quantity times.
     """
     minx, miny, maxx, maxy = part_geom.bounds
     pw = maxx - minx
     ph = maxy - miny
-    
     if pw <= 0 or ph <= 0 or quantity <= 0:
         return None
 
@@ -53,7 +53,6 @@ def calculate_minimum_remnant(part_geom, quantity, spacing=6.0, margin=15.0, all
     for rot in rotations:
         w_part = pw if rot == 0 else ph
         h_part = ph if rot == 0 else pw
-        
         eff_w = w_part + spacing
         eff_h = h_part + spacing
         
@@ -62,7 +61,6 @@ def calculate_minimum_remnant(part_geom, quantity, spacing=6.0, margin=15.0, all
             width = c * eff_w - spacing + 2 * margin
             height = r * eff_h - spacing + 2 * margin
             area = width * height
-            
             aspect = max(width, height) / max(1.0, min(width, height))
             score = area * (1.0 + 0.05 * max(0.0, aspect - 2.2))
             
@@ -78,6 +76,43 @@ def calculate_minimum_remnant(part_geom, quantity, spacing=6.0, margin=15.0, all
                 }
     return best
 
+def calculate_multi_part_remnant(parts_list, spacing=6.0, margin=15.0, allow_rotation=True):
+    """
+    Estimates the minimum offcut plate needed to fit an assortment of multiple parts.
+    """
+    items = []
+    for p in parts_list:
+        for _ in range(p.quantity):
+            items.append(p)
+            
+    if not items:
+        return None
+
+    total_net_area = sum(p.area for p in items)
+    # Estimate dimensions based on area with 1.6:1 aspect ratio and ~70% packing efficiency
+    est_material_area = total_net_area / 0.72
+    aspect = 1.6
+    est_h = math.sqrt(est_material_area / aspect)
+    est_w = est_h * aspect
+
+    # Test candidate bounding box dimensions
+    best_res = None
+    for mult in [0.9, 1.0, 1.15, 1.3, 1.5, 1.8]:
+        w_test = math.ceil((est_w * mult) / 50.0) * 50.0 + 2 * margin
+        h_test = math.ceil((est_h * mult) / 50.0) * 50.0 + 2 * margin
+        engine = NestingEngine(sheet_width=w_test, sheet_height=h_test, part_spacing=spacing, sheet_margin=margin, allow_rotation=allow_rotation)
+        sheets = engine._pack_items_shelf(items, w_test, h_test)
+        if len(sheets) == 1 and len(sheets[0].placed_parts) == len(items):
+            area = w_test * h_test
+            if best_res is None or area < best_res['area']:
+                best_res = {
+                    'width': w_test,
+                    'height': h_test,
+                    'area': area,
+                    'area_m2': round(area / 1e6, 3)
+                }
+    return best_res
+
 class NestingEngine:
     def __init__(self, 
                  sheet_width=3000.0, 
@@ -92,36 +127,57 @@ class NestingEngine:
         self.margin = float(sheet_margin)
         self.kerf = float(kerf)
         self.allow_rotation = allow_rotation
-        
-        self.usable_w = max(0.0, self.sheet_w - 2 * self.margin)
-        self.usable_h = max(0.0, self.sheet_h - 2 * self.margin)
 
     def pack(self, part_geom, total_quantity):
-        """Standard single-sheet-size packing (manual mode)."""
-        return self._pack_fixed_sheet_size(part_geom, total_quantity, self.sheet_w, self.sheet_h)
+        """Single-part manual packing."""
+        return self._pack_single_fixed(part_geom, total_quantity, self.sheet_w, self.sheet_h)
 
     def pack_auto_procurement(self, part_geom, total_quantity, target_mode="market_sheets"):
+        """Single-part auto market optimization."""
+        return self.pack_multi_auto_procurement([part_geom], target_mode=target_mode)
+
+    def pack_multi_parts_fixed(self, parts_list, sheet_w=None, sheet_h=None, sheet_name=None, is_remnant=False):
+        """Packs a list of heterogeneous parts onto fixed-size sheet(s)."""
+        sw = float(sheet_w or self.sheet_w)
+        sh = float(sheet_h or self.sheet_h)
+
+        items = []
+        for p in parts_list:
+            for i in range(p.quantity):
+                items.append(p)
+
+        sheets = self._pack_items_shelf(items, sw, sh, sheet_name=sheet_name, is_remnant=is_remnant)
+        return self._build_multi_summary(parts_list, items, sheets, sw, sh)
+
+    def pack_multi_auto_procurement(self, parts_list, target_mode="market_sheets"):
         """
-        Smart Workshop Optimization Mode:
-        - If 'remnant_only': packs on the exact minimum offcut.
-        - If 'market_sheets': automatically selects the smallest standard market sheet(s)
-          and computes offcut recommendations for leftovers.
+        Smart Workshop Optimization for Multi-Part Assortments:
+        - Evaluates market standard sheets (1x2m, 1.25x2.5m, 1.5x3m).
+        - Selects the smallest sheet that accommodates all parts, or packs onto multiple sheets.
+        - Computes minimum offcut (remnant) dimensions for the entire job.
         """
-        minx, miny, maxx, maxy = part_geom.bounds
-        pw = maxx - minx
-        ph = maxy - miny
-        
-        # 1. Calculate minimum remnant (offcut)
-        remnant = calculate_minimum_remnant(part_geom, total_quantity, self.spacing, self.margin, self.allow_rotation)
+        items = []
+        for p in parts_list:
+            for i in range(p.quantity):
+                items.append(p)
+
+        total_placed_needed = len(items)
+        if total_placed_needed == 0:
+            raise ValueError("Total quantity is 0!")
+
+        # 1. Calculate minimum remnant
+        if len(parts_list) == 1:
+            remnant = calculate_minimum_remnant(parts_list[0], total_placed_needed, self.spacing, self.margin, self.allow_rotation)
+        else:
+            remnant = calculate_multi_part_remnant(parts_list, self.spacing, self.margin, self.allow_rotation)
 
         if target_mode == "remnant_only" and remnant:
-            res = self._pack_fixed_sheet_size(
-                part_geom, total_quantity, 
-                sheet_w=remnant['width'], 
-                sheet_h=remnant['height'], 
-                sheet_name=f"Remnant Plate ({int(remnant['width'])} × {int(remnant['height'])} mm)",
+            sheets = self._pack_items_shelf(
+                items, remnant['width'], remnant['height'], 
+                sheet_name=f"Remnant Plate ({int(remnant['width'])} × {int(remnant['height'])} mm)", 
                 is_remnant=True
             )
+            res = self._build_multi_summary(parts_list, items, sheets, remnant['width'], remnant['height'])
             res['remnant_info'] = remnant
             res['procurement_advice'] = (
                 f"💡 Nested on minimum possible offcut plate: ({int(remnant['width'])} × {int(remnant['height'])} mm) "
@@ -129,277 +185,215 @@ class NestingEngine:
             )
             return res
 
-        # 2. Market Sheet Selection Strategy
-        single_opts = []
+        # 2. Check if entire order fits on a single market sheet (ascending by size)
         for s in MARKET_SHEETS:
-            cap = self._get_sheet_capacity(part_geom, s['w'], s['h'])
-            if cap >= total_quantity:
-                single_opts.append((s, cap))
-
-        if single_opts:
-            best_sheet, cap = single_opts[0]
-            res = self._pack_fixed_sheet_size(
-                part_geom, total_quantity, 
-                sheet_w=best_sheet['w'], 
-                sheet_h=best_sheet['h'], 
-                sheet_name=f"Standard Sheet {best_sheet['name']}"
-            )
-            res['remnant_info'] = remnant
-            res['procurement_advice'] = (
-                f"✅ Procurement Recommendation: Order 1 sheet of {best_sheet['name']} only (capacity: {cap} parts). "
-                f"No need to purchase a larger sheet, minimizing material cost.\n\n"
-                f"♻️ Workshop Remnant Alternative: If you have a scrap/offcut plate measuring at least "
-                f"({int(remnant['width'])} × {int(remnant['height'])} mm - {remnant['area_m2']} m²), "
-                f"you can run this entire order from it and save opening any new sheet!"
-            )
-            return res
-        else:
-            # Multi-sheet strategy: bulk 1500x3000 sheets
-            bulk_sheet = MARKET_SHEETS[2]  # 1500x3000
-            cap_bulk = self._get_sheet_capacity(part_geom, bulk_sheet['w'], bulk_sheet['h'])
-            if cap_bulk == 0:
-                raise ValueError("Part dimensions exceed standard market sheet sizes!")
-            
-            full_sheets_count = total_quantity // cap_bulk
-            rem_qty = total_quantity % cap_bulk
-
-            all_sheets = []
-            rem_remnant_info = None
-            
-            placed_so_far = 0
-            for i in range(full_sheets_count):
-                sheet_idx = i + 1
-                sh_res = self._simulate_sheet_parts(
-                    part_geom, cap_bulk, bulk_sheet['w'], bulk_sheet['h'], 
-                    sheet_idx=sheet_idx, 
-                    sheet_name=f"Primary Sheet {bulk_sheet['name']} ({sheet_idx}/{full_sheets_count + (1 if rem_qty > 0 else 0)})"
+            sheets = self._pack_items_shelf(items, s['w'], s['h'], sheet_name=f"Standard Sheet {s['name']}")
+            if len(sheets) == 1 and len(sheets[0].placed_parts) == total_placed_needed:
+                res = self._build_multi_summary(parts_list, items, sheets, s['w'], s['h'])
+                res['remnant_info'] = remnant
+                rem_text = f"({int(remnant['width'])} × {int(remnant['height'])} mm - {remnant['area_m2']} m²)" if remnant else ""
+                res['procurement_advice'] = (
+                    f"✅ Procurement Recommendation: Order 1 sheet of {s['name']} only. "
+                    f"All {total_placed_needed} parts fit inside, avoiding oversized sheets.\n\n"
+                    f"♻️ Workshop Remnant Alternative: If you have a scrap/offcut plate of at least {rem_text}, "
+                    f"you can cut this entire job from it and save opening any new sheet!"
                 )
-                all_sheets.append(sh_res)
-                placed_so_far += len(sh_res.placed_parts)
+                return res
 
-            rem_sheet_name = ""
-            if rem_qty > 0:
-                rem_sheet_choice = bulk_sheet
-                for s in MARKET_SHEETS:
-                    if self._get_sheet_capacity(part_geom, s['w'], s['h']) >= rem_qty:
-                        rem_sheet_choice = s
-                        break
+        # 3. Exceeds single sheet: Multi-sheet strategy with primary 1500x3000 mm
+        bulk_sheet = MARKET_SHEETS[2]  # 1500x3000
+        sheets = self._pack_items_shelf(items, bulk_sheet['w'], bulk_sheet['h'], sheet_name=f"Sheet {bulk_sheet['name']}")
+        res = self._build_multi_summary(parts_list, items, sheets, bulk_sheet['w'], bulk_sheet['h'])
+        res['remnant_info'] = remnant
+        
+        num_sheets = len(sheets)
+        rem_text = f"({int(remnant['width'])} × {int(remnant['height'])} mm)" if remnant else ""
+        res['procurement_advice'] = (
+            f"✅ Workshop Procurement Plan: Order {num_sheets} sheet(s) of 1500 × 3000 mm.\n"
+            f"Total parts: {total_placed_needed} distributed across {num_sheets} sheet(s).\n\n"
+            f"♻️ Workshop Check: Total minimum offcut required is ~{rem_text} if using remnants."
+        )
+        return res
+
+    def _pack_items_shelf(self, items, sheet_w, sheet_h, sheet_name=None, is_remnant=False):
+        """
+        Shelf & Best-Fit decreasing 2D packing algorithm for heterogeneous items.
+        """
+        usable_w = sheet_w - 2 * self.margin
+        usable_h = sheet_h - 2 * self.margin
+        
+        if usable_w <= 0 or usable_h <= 0:
+            raise ValueError("Sheet margin exceeds sheet dimensions!")
+
+        # Sort items by height descending (tallest first)
+        def sort_key(it):
+            w = it.width
+            h = it.height
+            return max(w, h) if self.allow_rotation else h
+
+        sorted_items = sorted(items, key=sort_key, reverse=True)
+
+        sheets = []
+        current_sheet_idx = 1
+        current_sh = SheetResult(current_sheet_idx, sheet_w, sheet_h, sheet_name=sheet_name or f"Sheet {current_sheet_idx}", is_remnant=is_remnant)
+        shelves = []  # list of {'y': float, 'height': float, 'current_x': float}
+        sheets.append(current_sh)
+
+        part_inst_counter = {}
+
+        for item in sorted_items:
+            pw = item.width
+            ph = item.height
+            base_poly = translate(item.outer_poly, xoff=-item.bounds[0], yoff=-item.bounds[1])
+
+            # Orientations to test
+            orientations = [(pw, ph, 0, base_poly)]
+            if self.allow_rotation and abs(pw - ph) > 0.1:
+                orientations.append((ph, pw, 90, rotate(base_poly, 90, origin=(0, 0))))
+
+            placed = False
+            # 1. Try placing in existing shelves on the active sheet
+            for sh in shelves:
+                for w, h, rot, poly_rot in orientations:
+                    eff_w = w + self.spacing
+                    if (sh['current_x'] + eff_w - self.spacing <= usable_w) and (h <= sh['height']):
+                        pos_x = self.margin + sh['current_x']
+                        pos_y = self.margin + sh['y']
+                        sh['current_x'] += eff_w
                         
-                rem_remnant_info = calculate_minimum_remnant(part_geom, rem_qty, self.spacing, self.margin, self.allow_rotation)
-                rem_sheet_idx = len(all_sheets) + 1
-                rem_sh_res = self._simulate_sheet_parts(
-                    part_geom, rem_qty, rem_sheet_choice['w'], rem_sheet_choice['h'], 
-                    sheet_idx=rem_sheet_idx, 
-                    sheet_name=f"Remainder Sheet {rem_sheet_choice['name']} ({rem_sheet_idx}/{rem_sheet_idx})"
-                )
-                all_sheets.append(rem_sh_res)
-                placed_so_far += len(rem_sh_res.placed_parts)
-                rem_sheet_name = rem_sheet_choice['name']
+                        part_inst_counter[item.name] = part_inst_counter.get(item.name, 0) + 1
+                        lbl = f"{item.name} #{part_inst_counter[item.name]}"
+                        
+                        placed_poly = translate(poly_rot, xoff=pos_x, yoff=pos_y)
+                        current_sh.placed_parts.append(PlacedPart(
+                            part_index=len(current_sh.placed_parts) + 1,
+                            sheet_index=current_sh.sheet_index,
+                            x=pos_x,
+                            y=pos_y,
+                            rotation=rot,
+                            width=w,
+                            height=h,
+                            polygon=placed_poly,
+                            part_geom=item,
+                            label=lbl
+                        ))
+                        placed = True
+                        break
+                if placed:
+                    break
 
-            total_placed = placed_so_far
-            total_sheet_material_area = sum(s.width * s.height for s in all_sheets)
-            total_parts_area = total_placed * part_geom.area
-            overall_util = (total_parts_area / total_sheet_material_area) * 100.0 if total_sheet_material_area > 0 else 0.0
-            overall_scrap = 100.0 - overall_util
-            total_cut_m = (total_placed * part_geom.total_perimeter) / 1000.0
+            if placed:
+                continue
 
-            if rem_qty > 0 and rem_remnant_info:
-                advice = (
-                    f"✅ Workshop Procurement Plan:\n"
-                    f"• Order {full_sheets_count} sheet(s) of 1500 × 3000 mm.\n"
-                    f"• For remainder ({rem_qty} parts): Order 1 smaller sheet of {rem_sheet_name} instead of a full 3m sheet.\n\n"
-                    f"♻️ Maximum Savings: If an offcut plate of at least "
-                    f"({int(rem_remnant_info['width'])} × {int(rem_remnant_info['height'])} mm) is available in the workshop, "
-                    f"you can cut the remaining {rem_qty} parts from it and save purchasing the extra sheet completely!"
-                )
-            else:
-                advice = f"✅ Workshop Procurement Plan: Order exactly {full_sheets_count} sheet(s) of 1500 × 3000 mm (exact fit with no remainder)."
+            # 2. Try opening a new shelf on the active sheet
+            current_top = sum(sh['height'] + self.spacing for sh in shelves)
+            for w, h, rot, poly_rot in orientations:
+                eff_w = w + self.spacing
+                eff_h = h + self.spacing
+                if (current_top + eff_h - self.spacing <= usable_h) and (eff_w - self.spacing <= usable_w):
+                    new_sh = {'y': current_top, 'height': h, 'current_x': eff_w}
+                    shelves.append(new_sh)
+                    pos_x = self.margin
+                    pos_y = self.margin + current_top
+                    
+                    part_inst_counter[item.name] = part_inst_counter.get(item.name, 0) + 1
+                    lbl = f"{item.name} #{part_inst_counter[item.name]}"
+                    
+                    placed_poly = translate(poly_rot, xoff=pos_x, yoff=pos_y)
+                    current_sh.placed_parts.append(PlacedPart(
+                        part_index=len(current_sh.placed_parts) + 1,
+                        sheet_index=current_sh.sheet_index,
+                        x=pos_x,
+                        y=pos_y,
+                        rotation=rot,
+                        width=w,
+                        height=h,
+                        polygon=placed_poly,
+                        part_geom=item,
+                        label=lbl
+                    ))
+                    placed = True
+                    break
 
-            return {
-                "requested_quantity": total_quantity,
-                "placed_quantity": total_placed,
-                "sheets_needed": len(all_sheets),
-                "parts_per_sheet": f"Distributed across {len(all_sheets)} sheet(s)",
-                "sheet_size_mm": f"{len(all_sheets)} sheet(s) (optimized sizes)",
-                "part_size_mm": f"{pw:.1f} × {ph:.1f}",
-                "spacing_mm": self.spacing,
-                "margin_mm": self.margin,
-                "kerf_mm": self.kerf,
-                "overall_utilization_pct": round(overall_util, 2),
-                "overall_scrap_pct": round(overall_scrap, 2),
-                "total_cut_length_meters": round(total_cut_m, 2),
-                "part_net_area_cm2": round(part_geom.area / 100.0, 2),
-                "sheets": all_sheets,
-                "remnant_info": remnant,
-                "procurement_advice": advice
-            }
+            if placed:
+                continue
 
-    def _get_sheet_capacity(self, part_geom, sw, sh):
-        minx, miny, maxx, maxy = part_geom.bounds
-        pw = maxx - minx
-        ph = maxy - miny
-        uw = max(0.0, sw - 2 * self.margin)
-        uh = max(0.0, sh - 2 * self.margin)
-        
-        c0 = int((uw + self.spacing) // (pw + self.spacing))
-        r0 = int((uh + self.spacing) // (ph + self.spacing))
-        cap0 = max(0, c0 * r0)
-        
-        cap90 = 0
-        if self.allow_rotation:
-            c90 = int((uw + self.spacing) // (ph + self.spacing))
-            r90 = int((uh + self.spacing) // (pw + self.spacing))
-            cap90 = max(0, c90 * r90)
-            
-        return max(cap0, cap90)
+            # 3. Need a new sheet
+            current_sheet_idx += 1
+            current_sh = SheetResult(current_sheet_idx, sheet_w, sheet_h, sheet_name=sheet_name or f"Sheet {current_sheet_idx}", is_remnant=is_remnant)
+            shelves = []
+            sheets.append(current_sh)
 
-    def _pack_fixed_sheet_size(self, part_geom, total_quantity, sheet_w, sheet_h, sheet_name=None, is_remnant=False):
-        minx, miny, maxx, maxy = part_geom.bounds
-        pw = maxx - minx
-        ph = maxy - miny
-        
-        uw = max(0.0, sheet_w - 2 * self.margin)
-        uh = max(0.0, sheet_h - 2 * self.margin)
-        
-        if uw <= 0 or uh <= 0:
-            raise ValueError("Sheet margin is larger than the sheet dimensions!")
+            for w, h, rot, poly_rot in orientations:
+                eff_w = w + self.spacing
+                eff_h = h + self.spacing
+                if (eff_h - self.spacing <= usable_h) and (eff_w - self.spacing <= usable_w):
+                    new_sh = {'y': 0.0, 'height': h, 'current_x': eff_w}
+                    shelves.append(new_sh)
+                    pos_x = self.margin
+                    pos_y = self.margin
+                    
+                    part_inst_counter[item.name] = part_inst_counter.get(item.name, 0) + 1
+                    lbl = f"{item.name} #{part_inst_counter[item.name]}"
+                    
+                    placed_poly = translate(poly_rot, xoff=pos_x, yoff=pos_y)
+                    current_sh.placed_parts.append(PlacedPart(
+                        part_index=len(current_sh.placed_parts) + 1,
+                        sheet_index=current_sh.sheet_index,
+                        x=pos_x,
+                        y=pos_y,
+                        rotation=rot,
+                        width=w,
+                        height=h,
+                        polygon=placed_poly,
+                        part_geom=item,
+                        label=lbl
+                    ))
+                    placed = True
+                    break
 
-        base_poly = translate(part_geom.outer_poly, xoff=-minx, yoff=-miny)
-        
-        sheets_0, cap_0 = self._simulate_grid_shelf_custom(pw, ph, base_poly, total_quantity, 0, sheet_w, sheet_h, sheet_name, is_remnant)
-        if self.allow_rotation:
-            sheets_90, cap_90 = self._simulate_grid_shelf_custom(ph, pw, rotate(base_poly, 90, origin=(0,0)), total_quantity, 90, sheet_w, sheet_h, sheet_name, is_remnant)
-            if cap_90 > cap_0:
-                best_sheets = sheets_90
-                parts_per_sheet = cap_90
-            else:
-                best_sheets = sheets_0
-                parts_per_sheet = cap_0
-        else:
-            best_sheets = sheets_0
-            parts_per_sheet = cap_0
-
-        num_sheets = len(best_sheets)
-        total_placed = sum(len(s.placed_parts) for s in best_sheets)
+        # Calculate metrics for each sheet
         sheet_area = sheet_w * sheet_h
-        
-        for s in best_sheets:
-            sheet_parts_area = len(s.placed_parts) * part_geom.area
-            s.utilization_pct = (sheet_parts_area / sheet_area) * 100.0
+        for s in sheets:
+            parts_area = sum(p.part_geom.area for p in s.placed_parts if p.part_geom)
+            s.utilization_pct = (parts_area / sheet_area) * 100.0 if sheet_area > 0 else 0.0
             s.scrap_pct = 100.0 - s.utilization_pct
 
-        total_parts_area = total_placed * part_geom.area
-        total_sheet_material_area = num_sheets * sheet_area
-        overall_utilization = (total_parts_area / total_sheet_material_area) * 100.0 if total_sheet_material_area > 0 else 0.0
-        overall_scrap = 100.0 - overall_utilization
-        total_cut_length_m = (total_placed * part_geom.total_perimeter) / 1000.0
+        return sheets
+
+    def _build_multi_summary(self, parts_list, items, sheets, sheet_w, sheet_h):
+        total_items = len(items)
+        total_placed = sum(len(s.placed_parts) for s in sheets)
+        total_parts_net_area = sum(p.area for p in items)
+        total_material_area = sum(s.width * s.height for s in sheets)
+        
+        overall_util = (total_parts_net_area / total_material_area) * 100.0 if total_material_area > 0 else 0.0
+        overall_scrap = 100.0 - overall_util
+        total_cut_m = sum(p.total_perimeter for p in items) / 1000.0
 
         return {
-            "requested_quantity": total_quantity,
+            "requested_quantity": total_items,
             "placed_quantity": total_placed,
-            "sheets_needed": num_sheets,
-            "parts_per_sheet": parts_per_sheet,
+            "sheets_needed": len(sheets),
+            "parts_per_sheet": f"{total_placed} parts across {len(sheets)} sheet(s)",
             "sheet_size_mm": f"{int(sheet_w)} × {int(sheet_h)}",
-            "part_size_mm": f"{pw:.1f} × {ph:.1f}",
             "spacing_mm": self.spacing,
             "margin_mm": self.margin,
             "kerf_mm": self.kerf,
-            "overall_utilization_pct": round(overall_utilization, 2),
+            "overall_utilization_pct": round(overall_util, 2),
             "overall_scrap_pct": round(overall_scrap, 2),
-            "total_cut_length_meters": round(total_cut_length_m, 2),
-            "part_net_area_cm2": round(part_geom.area / 100.0, 2),
-            "sheets": best_sheets
+            "total_cut_length_meters": round(total_cut_m, 2),
+            "sheets": sheets
         }
 
-    def _simulate_sheet_parts(self, part_geom, qty, sheet_w, sheet_h, sheet_idx=1, sheet_name=None, is_remnant=False):
-        minx, miny, maxx, maxy = part_geom.bounds
-        pw = maxx - minx
-        ph = maxy - miny
-        base_poly = translate(part_geom.outer_poly, xoff=-minx, yoff=-miny)
-        
-        sheets_0, cap_0 = self._simulate_grid_shelf_custom(pw, ph, base_poly, qty, 0, sheet_w, sheet_h, sheet_name, is_remnant)
-        if self.allow_rotation:
-            sheets_90, cap_90 = self._simulate_grid_shelf_custom(ph, pw, rotate(base_poly, 90, origin=(0,0)), qty, 90, sheet_w, sheet_h, sheet_name, is_remnant)
-            target_sheet = sheets_90[0] if (cap_90 > cap_0 and sheets_90) else (sheets_0[0] if sheets_0 else None)
-        else:
-            target_sheet = sheets_0[0] if sheets_0 else None
-            
-        if target_sheet:
-            target_sheet.sheet_index = sheet_idx
-            sh_area = sheet_w * sheet_h
-            target_sheet.utilization_pct = (len(target_sheet.placed_parts) * part_geom.area / sh_area) * 100.0
-            target_sheet.scrap_pct = 100.0 - target_sheet.utilization_pct
-            return target_sheet
-        else:
-            return SheetResult(sheet_idx, sheet_w, sheet_h, sheet_name, is_remnant)
-
-    def _simulate_grid_shelf_custom(self, pw, ph, oriented_poly, total_qty, rot_angle, sheet_w, sheet_h, sheet_name=None, is_remnant=False):
-        uw = max(0.0, sheet_w - 2 * self.margin)
-        uh = max(0.0, sheet_h - 2 * self.margin)
-        
-        eff_w = pw + self.spacing
-        eff_h = ph + self.spacing
-
-        cols = int((uw + self.spacing) // eff_w)
-        rows = int((uh + self.spacing) // eff_h)
-        cols = max(1, cols)
-        rows = max(1, rows)
-        
-        if ((cols - 1) * eff_w + pw) > uw:
-            cols = max(1, cols - 1)
-        if ((rows - 1) * eff_h + ph) > uh:
-            rows = max(1, rows - 1)
-
-        parts_per_sheet = cols * rows
-        if parts_per_sheet == 0:
-            return [], 0
-
-        sheets = []
-        remaining_qty = total_qty
-        sheet_idx = 0
-        part_global_idx = 0
-
-        minx, miny, maxx, maxy = oriented_poly.bounds
-        poly_zero = translate(oriented_poly, xoff=-minx, yoff=-miny)
-
-        while remaining_qty > 0:
-            sheet_idx += 1
-            sh_label = sheet_name or f"Sheet {sheet_idx}"
-            sheet = SheetResult(sheet_idx, sheet_w, sheet_h, sheet_name=sh_label, is_remnant=is_remnant)
-            
-            for r in range(rows):
-                for c in range(cols):
-                    if remaining_qty <= 0:
-                        break
-                    part_global_idx += 1
-                    pos_x = self.margin + (c * eff_w)
-                    pos_y = self.margin + (r * eff_h)
-                    
-                    placed_poly = translate(poly_zero, xoff=pos_x, yoff=pos_y)
-                    placed = PlacedPart(
-                        part_index=part_global_idx,
-                        sheet_index=sheet_idx,
-                        x=pos_x,
-                        y=pos_y,
-                        rotation=rot_angle,
-                        width=pw,
-                        height=ph,
-                        polygon=placed_poly
-                    )
-                    sheet.placed_parts.append(placed)
-                    remaining_qty -= 1
-                    
-                if remaining_qty <= 0:
-                    break
-                    
-            sheets.append(sheet)
-
-        return sheets, parts_per_sheet
+    def _pack_single_fixed(self, part_geom, quantity, sheet_w, sheet_h):
+        return self.pack_multi_parts_fixed([part_geom], sheet_w, sheet_h)
 
     def export_nested_dxf(self, original_dxf_doc, sheets, output_path):
         """
         Exports the placed parts onto standard DXF sheet(s).
-        Dynamically handles different sheet sizes in the same job layout!
+        Preserves original CAD geometry for every individual part,
+        and adds part identification text labels (e.g. P1 #1, P2 #1).
         """
         out_doc = ezdxf.new('R2010')
         out_msp = out_doc.modelspace()
@@ -408,39 +402,7 @@ class NestingEngine:
         out_doc.layers.add(name='SHEET_MARGIN', color=5)   # Blue (usable margin)
         out_doc.layers.add(name='LASER_CUT', color=3)      # Green (part contours)
         out_doc.layers.add(name='LASER_HOLES', color=2)    # Yellow (inner cutouts)
-        out_doc.layers.add(name='TEXT_INFO', color=7)      # White
-
-        src_msp = original_dxf_doc.modelspace()
-        
-        all_x, all_y = [], []
-        for e in src_msp:
-            if e.dxftype() in ('LINE', 'LWPOLYLINE', 'CIRCLE', 'ARC', 'POLYLINE', 'SPLINE'):
-                try:
-                    if e.dxftype() == 'LINE':
-                        all_x.extend([e.dxf.start.x, e.dxf.end.x])
-                        all_y.extend([e.dxf.start.y, e.dxf.end.y])
-                    elif e.dxftype() == 'LWPOLYLINE':
-                        pts = e.get_points()
-                        all_x.extend([p[0] for p in pts])
-                        all_y.extend([p[1] for p in pts])
-                    elif e.dxftype() == 'POLYLINE':
-                        pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
-                        all_x.extend([p[0] for p in pts])
-                        all_y.extend([p[1] for p in pts])
-                    elif e.dxftype() == 'SPLINE':
-                        pts = [(p[0], p[1]) for p in e.flattening(distance=0.1)]
-                        all_x.extend([p[0] for p in pts])
-                        all_y.extend([p[1] for p in pts])
-                    elif e.dxftype() in ('CIRCLE', 'ARC'):
-                        cx, cy = e.dxf.center.x, e.dxf.center.y
-                        r = e.dxf.radius
-                        all_x.extend([cx - r, cx + r])
-                        all_y.extend([cy - r, cy + r])
-                except Exception:
-                    pass
-                    
-        src_minx = min(all_x) if all_x else 0.0
-        src_miny = min(all_y) if all_y else 0.0
+        out_doc.layers.add(name='TEXT_INFO', color=7)      # White (annotations)
 
         current_offset_x = 0.0
 
@@ -466,52 +428,70 @@ class NestingEngine:
                 (current_offset_x + self.margin, self.margin)
             ], dxfattribs={'layer': 'SHEET_MARGIN', 'color': 5})
 
-            # 3. Sheet info text
+            # 3. Sheet info banner
             title_text = getattr(sheet, 'sheet_name', f"SHEET {sheet.sheet_index}")
             info_str = f"{title_text} ({int(sw)}x{int(sh)}mm) | Qty: {len(sheet.placed_parts)} | Yield: {sheet.utilization_pct:.1f}% | Scrap: {sheet.scrap_pct:.1f}%"
             out_msp.add_text(info_str, dxfattribs={
                 'layer': 'TEXT_INFO',
-                'height': 35.0,
+                'height': 30.0,
                 'insert': (current_offset_x + self.margin, sh + 40.0)
             })
 
-            # 4. Replicate parts
+            # 4. Replicate each placed part instance
             for placed in sheet.placed_parts:
                 target_x = current_offset_x + placed.x
                 target_y = placed.y
                 rot = placed.rotation
+                pgeom = placed.part_geom
                 
-                for entity in src_msp:
-                    etype = entity.dxftype()
-                    if etype == 'LINE':
-                        p1 = self._transform_pt(entity.dxf.start.x - src_minx, entity.dxf.start.y - src_miny, rot, target_x, target_y)
-                        p2 = self._transform_pt(entity.dxf.end.x - src_minx, entity.dxf.end.y - src_miny, rot, target_x, target_y)
-                        out_msp.add_line(p1, p2, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
-                        
-                    elif etype == 'LWPOLYLINE':
-                        pts = entity.get_points()
-                        t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
-                        out_msp.add_lwpolyline(t_pts, close=entity.is_closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
-                        
-                    elif etype == 'POLYLINE':
-                        pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
-                        t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
-                        out_msp.add_lwpolyline(t_pts, close=entity.is_closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
-                        
-                    elif etype == 'SPLINE':
-                        pts = [(p[0], p[1]) for p in entity.flattening(distance=0.1)]
-                        t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
-                        out_msp.add_lwpolyline(t_pts, close=entity.closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
-                        
-                    elif etype == 'CIRCLE':
-                        c_pt = self._transform_pt(entity.dxf.center.x - src_minx, entity.dxf.center.y - src_miny, rot, target_x, target_y)
-                        out_msp.add_circle(c_pt, radius=entity.dxf.radius, dxfattribs={'layer': 'LASER_HOLES', 'color': 2})
-                        
-                    elif etype == 'ARC':
-                        c_pt = self._transform_pt(entity.dxf.center.x - src_minx, entity.dxf.center.y - src_miny, rot, target_x, target_y)
-                        new_start = (entity.dxf.start_angle + rot) % 360.0
-                        new_end = (entity.dxf.end_angle + rot) % 360.0
-                        out_msp.add_arc(c_pt, radius=entity.dxf.radius, start_angle=new_start, end_angle=new_end, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
+                # Part label on cut sheet
+                if placed.label:
+                    out_msp.add_text(placed.label, dxfattribs={
+                        'layer': 'TEXT_INFO',
+                        'height': 12.0,
+                        'insert': (target_x + 8.0, target_y + 8.0)
+                    })
+                
+                if pgeom and pgeom.dxf_entities:
+                    src_minx = pgeom.bounds[0]
+                    src_miny = pgeom.bounds[1]
+                    for entity in pgeom.dxf_entities:
+                        etype = entity.dxftype()
+                        if etype == 'LINE':
+                            p1 = self._transform_pt(entity.dxf.start.x - src_minx, entity.dxf.start.y - src_miny, rot, target_x, target_y)
+                            p2 = self._transform_pt(entity.dxf.end.x - src_minx, entity.dxf.end.y - src_miny, rot, target_x, target_y)
+                            out_msp.add_line(p1, p2, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
+                            
+                        elif etype == 'LWPOLYLINE':
+                            pts = entity.get_points()
+                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
+                            out_msp.add_lwpolyline(t_pts, close=entity.is_closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
+                            
+                        elif etype == 'POLYLINE':
+                            pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
+                            out_msp.add_lwpolyline(t_pts, close=entity.is_closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
+                            
+                        elif etype == 'SPLINE':
+                            pts = [(p[0], p[1]) for p in entity.flattening(distance=0.1)]
+                            t_pts = [self._transform_pt(p[0] - src_minx, p[1] - src_miny, rot, target_x, target_y) for p in pts]
+                            out_msp.add_lwpolyline(t_pts, close=entity.closed, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
+                            
+                        elif etype == 'CIRCLE':
+                            c_pt = self._transform_pt(entity.dxf.center.x - src_minx, entity.dxf.center.y - src_miny, rot, target_x, target_y)
+                            out_msp.add_circle(c_pt, radius=entity.dxf.radius, dxfattribs={'layer': 'LASER_HOLES', 'color': 2})
+                            
+                        elif etype == 'ARC':
+                            c_pt = self._transform_pt(entity.dxf.center.x - src_minx, entity.dxf.center.y - src_miny, rot, target_x, target_y)
+                            new_start = (entity.dxf.start_angle + rot) % 360.0
+                            new_end = (entity.dxf.end_angle + rot) % 360.0
+                            out_msp.add_arc(c_pt, radius=entity.dxf.radius, start_angle=new_start, end_angle=new_end, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
+                else:
+                    # Fallback to polygon coords if raw entities not attached
+                    if placed.polygon and not placed.polygon.is_empty:
+                        for g in ([placed.polygon] if isinstance(placed.polygon, Polygon) else placed.polygon.geoms):
+                            x, y = g.exterior.xy
+                            out_msp.add_lwpolyline(list(zip(x, y)), close=True, dxfattribs={'layer': 'LASER_CUT', 'color': 3})
 
             current_offset_x += sw + 300.0
 

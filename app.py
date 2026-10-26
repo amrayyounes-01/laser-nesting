@@ -18,13 +18,14 @@ importlib.reload(nesting_core)
 importlib.reload(nesting_packer)
 importlib.reload(preview)
 
-from nesting_core import parse_dxf
-from nesting_packer import NestingEngine, calculate_minimum_remnant, MARKET_SHEETS
+from nesting_core import parse_dxf_multi, parse_dxf
+from nesting_packer import NestingEngine, calculate_minimum_remnant, calculate_multi_part_remnant, MARKET_SHEETS
 from preview import generate_sheet_preview
 from create_sample_dxf import create_sample_bracket_dxf
+from create_sample_multi_dxf import create_sample_multi_part_dxf
 
 st.set_page_config(
-    page_title="AI Laser Nesting & Procurement Optimizer",
+    page_title="AI Laser Nesting & Multi-Part Optimizer",
     page_icon="⚙️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -78,6 +79,13 @@ st.markdown("""
         color: #e0e7ff;
         margin-bottom: 20px;
     }
+    .part-table-card {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 12px 16px;
+        margin-bottom: 10px;
+    }
     .stButton>button {
         width: 100%;
         border-radius: 8px;
@@ -88,16 +96,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Application Header
+# Header
 col_h1, col_h2 = st.columns([4, 1])
 with col_h1:
-    st.title("⚙️ AI Laser Nesting & Sheet Procurement Optimizer")
-    st.markdown("Smart CAM nesting engine for CNC fiber lasers. Automatically selects the **lowest-cost market sheet size** and calculates **exact workshop offcut (remnant) dimensions** to minimize material waste.")
+    st.title("⚙️ AI Laser Nesting & Multi-Part Procurement Optimizer")
+    st.markdown("Smart CAM nesting engine for CNC fiber lasers. Supports **multi-part DXF drawings with automatic quantity tags (Q10, Q9...)**, lowest-cost market sheet selection, and workshop remnant calculation.")
 with col_h2:
-    st.info("CAM Version 2.0\nFiber Laser Ready")
+    st.info("CAM Version 3.0\nMulti-Part Q-Tags")
 
 # Sidebar Configuration
-st.sidebar.header("🛠️ Material & Laser Machine Setup")
+st.sidebar.header("🛠️ Material & Laser Setup")
 
 procurement_mode = st.sidebar.radio(
     "🎯 Sheet Selection Strategy:",
@@ -148,11 +156,10 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-# Thickness & Thermal safety advice
+# Thickness & Spacing
 st.sidebar.write("")
 thickness = st.sidebar.slider("Sheet Thickness (mm)", min_value=0.5, max_value=25.0, value=3.0, step=0.5)
 
-# Calculate recommended spacing based on thickness
 if thickness <= 1.5:
     rec_spacing = 4.0
 elif thickness <= 3.0:
@@ -187,18 +194,23 @@ laser_kerf = st.sidebar.number_input(
 allow_rot = st.sidebar.checkbox("Allow 90° Part Rotation for Optimization", value=True)
 
 # Main Area: File Input
-st.subheader("1. Upload CAD Part (DXF File)")
+st.subheader("1. Upload CAD Drawing (DXF File)")
 
-col_u1, col_u2 = st.columns([3, 1])
+col_u1, col_u2, col_u3 = st.columns([3, 1, 1])
 with col_u1:
-    uploaded_file = st.file_uploader("Choose a DXF file from your computer", type=["dxf"])
+    uploaded_file = st.file_uploader("Choose a DXF file (Single part or Multi-part with Q-tags)", type=["dxf"])
 with col_u2:
-    st.write("Or try a sample part:")
-    use_sample = st.button("📁 Load Sample Bracket")
+    use_sample_multi = st.button("📁 Load Multi-Part (Q-Tags)")
+with col_u3:
+    use_sample_single = st.button("📁 Load Single Bracket")
 
-sample_file_path = "sample_bracket.dxf"
-if not os.path.exists(sample_file_path):
-    create_sample_bracket_dxf(sample_file_path)
+sample_single_path = "sample_bracket.dxf"
+sample_multi_path = "sample_multi_parts.dxf"
+
+if not os.path.exists(sample_single_path):
+    create_sample_bracket_dxf(sample_single_path)
+if not os.path.exists(sample_multi_path):
+    create_sample_multi_part_dxf(sample_multi_path)
 
 active_dxf_bytes = None
 active_filename = ""
@@ -206,62 +218,105 @@ active_filename = ""
 if uploaded_file is not None:
     active_dxf_bytes = uploaded_file.getvalue()
     active_filename = uploaded_file.name
-elif use_sample:
-    with open(sample_file_path, "rb") as f:
+elif use_sample_multi:
+    with open(sample_multi_path, "rb") as f:
+        active_dxf_bytes = f.read()
+    active_filename = "sample_multi_parts.dxf"
+elif use_sample_single:
+    with open(sample_single_path, "rb") as f:
         active_dxf_bytes = f.read()
     active_filename = "sample_bracket.dxf"
 
 if active_dxf_bytes is not None:
     try:
-        # Parse DXF
-        part = parse_dxf(active_dxf_bytes)
+        # Parse DXF (supports both single and multi-part with Q-tags)
+        detected_parts = parse_dxf_multi(active_dxf_bytes)
+        num_parts = len(detected_parts)
         
-        # Display Part Info
-        st.success(f"File parsed successfully: **{active_filename}**")
+        st.success(f"File parsed successfully: **{active_filename}** — Detected **{num_parts} distinct part(s)**")
         
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-value">{part.width:.1f} × {part.height:.1f}</div>
-                <div class="metric-label">Part Dimensions (mm)</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-value">{(part.area / 100):.1f}</div>
-                <div class="metric-label">Net Surface Area (cm²)</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with c3:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-value">{len(part.holes)}</div>
-                <div class="metric-label">Internal Holes / Cutouts</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with c4:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-value">{(part.total_perimeter / 1000):.2f}</div>
-                <div class="metric-label">Cut Length / Part (m)</div>
-            </div>
-            """, unsafe_allow_html=True)
+        st.write("")
+        st.subheader("2. Detected Parts & Quantities")
+        
+        if num_parts > 1:
+            st.info("✨ **Multi-Part Drawing Detected:** The system automatically identified each separate part and extracted its corresponding quantity tag (e.g. Q10, Q9...) from the drawing. You can review or adjust the quantities below:")
+            
+            # Interactive Part Quantities Table / Grid
+            cols_per_row = 2
+            for i in range(0, num_parts, cols_per_row):
+                row_cols = st.columns(cols_per_row)
+                for j in range(cols_per_row):
+                    p_idx = i + j
+                    if p_idx < num_parts:
+                        p = detected_parts[p_idx]
+                        with row_cols[j]:
+                            tag_label = f" (Tag: {p.matched_text})" if p.matched_text else ""
+                            with st.container():
+                                st.markdown(f"""
+                                <div class="part-table-card">
+                                    <div style="font-weight: 700; color: #38bdf8; font-size: 16px;">
+                                        Part #{p.part_id}{tag_label}
+                                    </div>
+                                    <div style="color: #94a3b8; font-size: 13px; margin: 4px 0 8px 0;">
+                                        Size: <b>{p.width:.1f} × {p.height:.1f} mm</b> | Area: <b>{p.area/100:.1f} cm²</b> | Holes: <b>{len(p.holes)}</b>
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                new_q = st.number_input(
+                                    f"Quantity for Part #{p.part_id}",
+                                    min_value=1,
+                                    max_value=10000,
+                                    value=int(p.quantity),
+                                    step=1,
+                                    key=f"p_qty_{p_idx}"
+                                )
+                                p.quantity = new_q
+                                
+            total_items_to_cut = sum(p.quantity for p in detected_parts)
+            st.markdown(f"**Total Quantity Across All Parts: `{total_items_to_cut}` pieces**")
+            
+        else:
+            # Single part file
+            p = detected_parts[0]
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-value">{p.width:.1f} × {p.height:.1f}</div>
+                    <div class="metric-label">Part Dimensions (mm)</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with c2:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-value">{(p.area / 100):.1f}</div>
+                    <div class="metric-label">Net Surface Area (cm²)</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with c3:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-value">{len(p.holes)}</div>
+                    <div class="metric-label">Internal Holes / Cutouts</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with c4:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-value">{(p.total_perimeter / 1000):.2f}</div>
+                    <div class="metric-label">Cut Length / Part (m)</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            single_qty = st.number_input("Required Production Quantity (parts)", min_value=1, max_value=50000, value=int(p.quantity if p.quantity > 1 else 12), step=1)
+            p.quantity = single_qty
 
         st.write("")
-        st.subheader("2. Production Quantity & Order Setup")
-        
-        col_q1, col_q2 = st.columns([2, 2])
-        with col_q1:
-            quantity = st.number_input("Required Production Quantity (parts)", min_value=1, max_value=50000, value=12, step=1)
-        with col_q2:
-            st.write("")
-            st.write("")
-            start_nesting = st.button("🚀 Run Nesting & Calculate Optimal Material", type="primary")
+        start_nesting = st.button("🚀 Run Nesting & Calculate Optimal Material", type="primary")
 
         if start_nesting:
-            with st.spinner("Analyzing market sheet sizes and optimizing material usage..."):
+            with st.spinner("Nesting all parts and analyzing optimal sheet sizes..."):
                 engine = NestingEngine(
                     sheet_width=sheet_w,
                     sheet_height=sheet_h,
@@ -272,12 +327,15 @@ if active_dxf_bytes is not None:
                 )
                 
                 if procurement_mode == "🧠 Smart Auto-Procurement (Smallest Market Sheet + Remnant Check)":
-                    result = engine.pack_auto_procurement(part, quantity, target_mode="market_sheets")
+                    result = engine.pack_multi_auto_procurement(detected_parts, target_mode="market_sheets")
                 elif procurement_mode == "♻️ Nest on Minimum Remnant Only (Offcut)":
-                    result = engine.pack_auto_procurement(part, quantity, target_mode="remnant_only")
+                    result = engine.pack_multi_auto_procurement(detected_parts, target_mode="remnant_only")
                 else:
-                    result = engine.pack(part, quantity)
-                    rem = calculate_minimum_remnant(part, quantity, part_spacing, sheet_margin, allow_rot)
+                    result = engine.pack_multi_parts_fixed(detected_parts, sheet_w, sheet_h)
+                    if len(detected_parts) == 1:
+                        rem = calculate_minimum_remnant(detected_parts[0], detected_parts[0].quantity, part_spacing, sheet_margin, allow_rot)
+                    else:
+                        rem = calculate_multi_part_remnant(detected_parts, part_spacing, sheet_margin, allow_rot)
                     result['remnant_info'] = rem
                 
                 st.write("")
@@ -322,8 +380,8 @@ if active_dxf_bytes is not None:
                 with r2:
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value">{result['parts_per_sheet']}</div>
-                        <div class="metric-label">Part Allocation</div>
+                        <div class="metric-value">{result['placed_quantity']}</div>
+                        <div class="metric-label">Total Parts Nested</div>
                     </div>
                     """, unsafe_allow_html=True)
                 with r3:
@@ -368,7 +426,7 @@ if active_dxf_bytes is not None:
                 output_dxf_path = output_dxf_temp.name
                 output_dxf_temp.close()
                 
-                engine.export_nested_dxf(part.doc, result['sheets'], output_dxf_path)
+                engine.export_nested_dxf(detected_parts[0].doc, result['sheets'], output_dxf_path)
                 
                 with open(output_dxf_path, "rb") as df:
                     dxf_bytes = df.read()
@@ -383,21 +441,24 @@ if active_dxf_bytes is not None:
                         type="primary"
                     )
                 with col_d2:
-                    summary_text = f"""CNC Laser Procurement & Production Report:
+                    summary_text = f"""CNC Laser Multi-Part Procurement & Production Report:
 -----------------------------------------------------------
-Part File: {active_filename}
-Order Quantity: {quantity} parts
+Drawing File: {active_filename}
+Total Parts Count: {result['placed_quantity']} parts
+Distinct Part Types: {num_parts}
 Sheet Thickness: {thickness} mm
 Part Spacing: {part_spacing} mm
 Edge Margin: {sheet_margin} mm
 Laser Kerf: {laser_kerf} mm
 
+Parts Breakdown:
+"""
+                    for p in detected_parts:
+                        summary_text += f"- {p.name}: {p.width:.1f}x{p.height:.1f} mm | Quantity: {p.quantity}\n"
+
+                    summary_text += f"""
 Purchasing & Material Recommendation:
 {result.get('procurement_advice', 'Custom/Manual Selection')}
-
-Minimum Remnant (Offcut) Required:
-- Dimensions: {int(rem_info['width'])} × {int(rem_info['height'])} mm
-- Required Area: {rem_info['area_m2']} m²
 
 Production Metrics:
 - Sheets Required: {result['sheets_needed']}
@@ -416,4 +477,4 @@ Production Metrics:
         st.error(f"Error processing file: {str(err)}")
 
 else:
-    st.info("👆 Please upload a DXF part file or click 'Load Sample Bracket' to test the system.")
+    st.info("👆 Please upload a DXF drawing or click 'Load Multi-Part (Q-Tags)' to test the system.")
